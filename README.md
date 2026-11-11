@@ -53,3 +53,34 @@ tp2:baseline          3e2e12a8338f       1.88GB          474MB
 **Résultat :** Le poids du contexte envoyé à Docker passe de **14 Mo à 48 Ko**. C'est beaucoup plus propre. 
 La taille finale de l'image ne bouge pas encore (c'est l'image de base `node:latest` qui pèse  lourd). 
 *Note : Pour les prochaines étapes, je comparerai les temps de build en utilisant `--no-cache` pour ne pas fausser les résultats.*
+
+Pour savoir d'où vient le poids, j'ai regardé les layers :
+```bash
+$ docker history tp2:01-dockerignore
+CREATED BY                                      SIZE
+RUN npm run build                               36.9kB
+RUN apt-get update && apt-get ins…              50.1MB
+RUN npm install                                 25.8MB
+COPY . /app                                     81.9kB
+WORKDIR /app                                    8.19kB
+(couches de node:latest)                        696MB, 240MB, 202MB, 134MB, 65MB
+
+$ docker run --rm tp2:01-dockerignore du -sh /root/.npm /app/node_modules
+7.0M    /root/.npm
+16M     /app/node_modules
+```
+
+# On passe d'une Debian complète (node:latest) à une version Alpine très légère
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+# On utilise "npm ci --production" pour installer uniquement les deps de prod
+# (sans nodemon) de manière déterministe, et on nettoie le cache dans la même couche
+RUN npm ci --production && npm cache clean --force
+COPY . .
+# L'installation d'outils OS (apt-get) n'est plus nécessaire ici
+EXPOSE 3000
+ENV NODE_ENV=development
+RUN npm run build
+USER root
+CMD ["node", "server.js"]
