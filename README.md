@@ -176,3 +176,77 @@ real    0m1.372s
 - Le premier build n'est pas plus rapide. Le gain n'existe que sur les rebuilds.
 - Ici l'app est petite (`npm install` dure environ 3 s). Le gain est proportionnel au temps d'installation des dépendances donc plus visible sur un gros projet.
 - J'ai testé en ajoutant un fichier au projet (`note.txt`, puis `note2.txt`) : seul `COPY . .` est relancé et `npm install` reste `CACHED`. C'est pareil pour le `README.md`, qui n'est pas dans le `.dockerignore` : modifier la doc ne relance plus `npm install`. (Un tout premier essai avec `note.txt` avait affiché `COPY . .` en `CACHED`, sans que je sache l'expliquer ; refait ensuite, le résultat était conforme.)
+
+
+## Étape 4 : Faire le tri dans les dépendances
+
+### 4a. Installation propre pour la prod (`npm ci --omit=dev`)
+
+Jusqu'ici, mon `RUN npm install` installait tout, y compris les *devDependencies* comme `nodemon` (rechargement à chaud en développement), inutile ici puisque le conteneur se lance avec `node server.js`.
+
+J'ai donc remplacé cette ligne par :
+```dockerfile
+RUN npm ci --omit=dev && npm cache clean --force
+```
+
+Pourquoi cette commande ?
+- `npm ci` : build reproductible, basé strictement sur le `package-lock.json`.
+- `--omit=dev` : exclut les dépendances de développement.
+- `npm cache clean --force` : vide le cache npm dans la même instruction `RUN`. Les layers Docker étant immuables, le faire dans un `RUN` séparé n'aurait pas réduit la taille de l'image.
+
+Mesure de l'impact :
+```bash
+$ docker images tp2
+IMAGE                  ID             DISK USAGE   CONTENT SIZE
+tp2:03-apres           2e150e712e8c        284MB         69.3MB
+tp2:04a-prod-deps      0a61426dcc84        271MB         65.9MB
+
+$ docker run --rm tp2:04a-prod-deps du -sh /app/node_modules /root/.npm
+13.2M   /app/node_modules
+60.0K   /root/.npm
+```
+
+Résultat : -13 MB en DISK USAGE (-3.4 MB en CONTENT SIZE). `node_modules` passe de 16 MB à 13.2 MB et le cache npm de 7.0 MB à 60 KB (valeurs de l'étape 1, mesurées sur l'image Debian ; le layer `npm install` faisait la même taille sur Alpine). Nettoyer le cache fait donc gagner plus de place que retirer `nodemon`.
+
+### 4b. Suppression d'une dépendance inutilisée (`mongodb`)
+
+En regardant le `package.json`, `mongodb` est dans les `dependencies`, donc `--omit=dev` ne la retire pas. Pour vérifier si elle sert, j'ai cherché dans le code :
+```bash
+$ grep -n "require" server.js
+1:const express = require('express');
+2:const fs = require('fs');
+3:const path = require('path');
+
+$ grep -n "mongodb" server.js
+(aucun résultat)
+```
+
+`mongodb` n'est appelé nulle part (`fs` et `path` sont intégrés à Node). Je l'ai désinstallée avec `npm uninstall mongodb`, qui met à jour `package.json` et `package-lock.json` (nécessaire pour que `npm ci` continue de fonctionner).
+
+Mesure de l'impact :
+```bash
+$ docker images tp2
+IMAGE                  ID             DISK USAGE   CONTENT SIZE
+tp2:04a-prod-deps      0a61426dcc84        271MB         65.9MB
+tp2:04b-sans-mongodb   398eec5d16d7        260MB         64.2MB
+
+$ docker run --rm tp2:04b-sans-mongodb du -sh /app/node_modules
+4.4M    /app/node_modules
+```
+
+Test de fonctionnement (un `curl` lancé juste après `docker run` a échoué, probablement parce que le serveur n'écoutait pas encore, d'où le `sleep 2`) :
+```bash
+$ docker run -d --rm -p 3000:3000 --name tp2 tp2:04b-sans-mongodb
+$ sleep 2
+$ curl localhost:3000
+Hello world — serveur volontairement non optimisé mais fonctionnel
+$ docker logs tp2
+Serveur démarré sur le port 3000
+[2026-11-16T17:23:51.816Z] GET /
+```
+
+**Analyse :**
+- -11 MB en DISK USAGE : `node_modules` passe de 13.2 MB à 4.4 MB, donc `mongodb` et ses sous-dépendances représentaient les deux tiers des dépendances de production.
+- Le gain compressé (-1.7 MB) est bien plus faible que le gain décompressé (-9 MB environ) : le JavaScript se compresse bien.
+- Bilan par rapport à la baseline : l'image passe de 1.88 GB à 260 MB (-86 %), et de 474 MB à 64.2 MB en compressé (-86 %).
+- Remarque : `npm uninstall` a signalé 11 vulnérabilités (dont 1 critique). Cet audit inclut les devDependencies, et je n'ai pas lancé `npm audit fix` car ça change des versions, hors du périmètre de ce TP.
