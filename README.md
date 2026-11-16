@@ -131,3 +131,48 @@ Hello world — serveur volontairement non optimisé mais fonctionnel
 
 **Bilan pour la suite :**
 - Node représente maintenant 179 MB soit environ 83 % du poids de l'image. On ne pourra plus réduire beaucoup la taille. Les prochaines étapes d'optimisation viseront surtout l'architecture des couches (utilisation du cache) pour accélérer le rebuild.
+
+
+## Étape 3 : Ordre des layers (cache)
+
+Docker met en cache chaque instruction, et dès qu'une couche change toutes les suivantes sont reconstruites. Dans le Dockerfile de départ, `COPY . /app` était placé avant `RUN npm install` donc la moindre modification de code relançait `npm install`, même si `package.json` n'avait pas bougé.
+
+Mesure avant (rebuild avec cache après un petit changement dans `server.js`) :
+```bash
+$ time docker build -f dockerfile -t tp2:03-avant-rebuild .
+ => CACHED [2/5] WORKDIR /app
+ => [3/5] COPY . /app                      0.4s
+ => [4/5] RUN npm install                  2.7s
+ => [5/5] RUN npm run build                0.4s
+ => exporting to image                     1.1s
+real    0m4.937s
+```
+
+J'ai réorganisé le `Dockerfile` pour copier uniquement les fichiers qui définissent les dépendances d'abord, puis les installer, et enfin copier le reste du code (qui change souvent) :
+```dockerfile
+COPY package*.json ./
+RUN npm install
+COPY . .
+```
+
+### Mesure de l'impact ("Après")
+Je refais une modification dans `server.js` et je relance le build :
+```bash
+$ time docker build -f dockerfile -t tp2:03-apres-rebuild .
+ => CACHED [2/6] WORKDIR /app
+ => CACHED [3/6] COPY package*.json ./
+ => CACHED [4/6] RUN npm install
+ => [5/6] COPY . .                         0.4s
+ => [6/6] RUN npm run build                0.4s
+ => exporting to image                     0.2s
+real    0m1.372s
+```
+
+**Résultat :** le rebuild passe de 4.9 s à 1.4 s (-72 %).
+
+**Analyse :**
+- Les 3.6 s gagnés viennent de `npm install` (2.7 s) et de l'export de l'image (0.9 s) car la couche `npm install` de 25.8 MB n'est plus reconstruite.
+- La taille de l'image ne change pas ,on a seulement réordonné les instructions.
+- Le premier build n'est pas plus rapide. Le gain n'existe que sur les rebuilds.
+- Ici l'app est petite (`npm install` dure environ 3 s). Le gain est proportionnel au temps d'installation des dépendances donc plus visible sur un gros projet.
+- J'ai testé en ajoutant un fichier au projet (`note.txt`, puis `note2.txt`) : seul `COPY . .` est relancé et `npm install` reste `CACHED`. C'est pareil pour le `README.md`, qui n'est pas dans le `.dockerignore` : modifier la doc ne relance plus `npm install`. (Un tout premier essai avec `note.txt` avait affiché `COPY . .` en `CACHED`, sans que je sache l'expliquer ; refait ensuite, le résultat était conforme.)
