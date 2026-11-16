@@ -1,7 +1,8 @@
 FROM node:26-alpine
 WORKDIR /app
-COPY . /app
+COPY package*.json ./
 RUN npm install
+COPY . .
 EXPOSE 3000 4000 5000
 ENV NODE_ENV=development
 RUN npm run build
