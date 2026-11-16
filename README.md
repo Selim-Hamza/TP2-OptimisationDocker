@@ -250,3 +250,74 @@ Serveur démarré sur le port 3000
 - Le gain compressé (-1.7 MB) est bien plus faible que le gain décompressé (-9 MB environ) : le JavaScript se compresse bien.
 - Bilan par rapport à la baseline : l'image passe de 1.88 GB à 260 MB (-86 %), et de 474 MB à 64.2 MB en compressé (-86 %).
 - Remarque : `npm uninstall` a signalé 11 vulnérabilités (dont 1 critique). Cet audit inclut les devDependencies, et je n'ai pas lancé `npm audit fix` car ça change des versions, hors du périmètre de ce TP.
+
+
+## Étape 5 : Multi-stage build
+
+Un Dockerfile peut avoir plusieurs `FROM`.C'est le dernier stage qui  devient l'image finale, et `COPY --from=` permet de récupérer des fichiers d'un stage précédent. Le reste n'est pas embarqué.
+Ici le `npm run build` ne fait qu'un `echo` et ne produit aucun fichier donc je m'attends à un gain faible.
+
+### 5a. Deux stages : `deps` et image finale
+
+```dockerfile
+FROM node:26-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+FROM node:26-alpine
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+...
+```
+Le `COPY . .` n'écrase pas `node_modules` car le `.dockerignore` l'exclut du contexte.
+
+```bash
+$ docker images tp2
+IMAGE                  ID             DISK USAGE   CONTENT SIZE
+tp2:04b-sans-mongodb   398eec5d16d7        260MB         64.2MB
+tp2:05-multistage      5136195c87d2        259MB         64.1MB
+```
+Résultat : 1 MB en moins seulement, le multi-stage n'apporte rien à lui seul.
+Dans le `docker history` la couche `RUN npm run build` est passée de 36.9 kB à 2.05 MB. Probablement parce que l'étage final n'avait jamais lancé npm donc ce premier appel à créé des fichiers de travail (`/root/.npm`).
+
+### 5b. Faire le build dans le stage `builder`
+
+Je déplace `COPY . .` et `RUN npm run build` dans le premier stage (`builder`) et l'image finale récupère juste le résultat :
+```dockerfile
+FROM node:26-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY . .
+RUN npm run build
+
+FROM node:26-alpine
+WORKDIR /app
+COPY --from=builder /app ./
+...
+```
+```bash
+$ docker images tp2
+IMAGE                  ID             DISK USAGE   CONTENT SIZE
+tp2:05-multistage      5136195c87d2        259MB         64.1MB
+tp2:05b-builder        4480c0474d33        257MB         63.7MB
+
+$ docker run --rm tp2:05b-builder du -sh /root/.npm
+du: /root/.npm: No such file or directory
+```
+Test que l'app marche toujours :
+```bash
+$ docker run -d --rm -p 3000:3000 --name tp2 tp2:05b-builder
+$ sleep 2
+$ curl localhost:3000
+Hello world — serveur volontairement non optimisé mais fonctionnel
+```
+
+**Coclusion :**
+- Le multi-stage seul ne réduit rien. Les 2 MB gagnés viennent du fait de ne plus lancer npm dans l'image finale : la couche `RUN npm run build` a disparu et il n'y a plus de dossier `/root/.npm`
+- Sur toute l'étape on passe de 260 MB à 257 MB car l'app n'a pas de vrai build
+- L'intérêt est la structure : pour une app avec un vrai build (TypeScript, React...) on installerait toutes les dépendances dans `builder` et on ne copierait que le résultat compilé dans l'image finale
+- Bilan par rapport à la baseline, 1.88 GB → 257 MB (-86 %) et 474 MB → 63.7 MB en compressé
+- Node représente maintenant environ 93 % de l'image donc il reste très peu à gagner sur la taille
