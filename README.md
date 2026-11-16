@@ -363,3 +363,47 @@ Serveur démarré sur le port 3000
 - Le `touch /test` refusé confirme que le conteneur n'a plus les droits root. Si l'app était compromise, l'attaquant aurait moins de droits.
 - L'app marche sans `chown` , elle ne fait que lire ses fichiers, qui restent lisibles par l'utilisateur `node`. Un `chown -R` dans un `RUN` aurait dupliqué une couche et fait grossir l'image.
 - Je n'ai pas mesuré l'effet de `NODE_ENV=production` : `server.js` ne l'utilise pas directement donc je ne peux pas dire qu'il change quelque chose ici. Je le mets par convention.
+
+## Bilan
+
+### Dockerfile final
+
+```dockerfile
+FROM node:26-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY . .
+RUN npm run build
+
+FROM node:26-alpine
+WORKDIR /app
+COPY --from=builder /app ./
+EXPOSE 3000
+ENV NODE_ENV=production
+USER node
+CMD ["node", "server.js"]
+```
+
+### Récapitulatif des étapes
+
+| Étape | Changement | Taille disque | Taille compressée |
+|---|---|---|---|
+| 0 | Baseline (`node:latest`) | 1.88 GB | 474 MB |
+| 1 | `.dockerignore` | 1.89 GB | 477 MB |
+| 2a | Suppression de `apt-get` | 1.82 GB | 451 MB |
+| 2b | Image `node:26-alpine` | 284 MB | 69.3 MB |
+| 3 | Ordre des couches (cache) | 284 MB | 69.3 MB |
+| 4a | `npm ci --omit=dev` + nettoyage du cache | 271 MB | 65.9 MB |
+| 4b | Suppression de `mongodb` | 260 MB | 64.2 MB |
+| 5 | Multi-stage | 257 MB | 63.7 MB |
+| 6 | `USER node`, `NODE_ENV=production`, `EXPOSE 3000` | 257 MB | 63.7 MB |
+
+Au total on passe de 1.88 GB à 257 MB (-86 %) et de 474 MB à 63.7 MB en compressé (-87 %).
+
+### Ce que je retiens
+
+- Le changement d'image de base (étape 2b) fait presque tout : 1.82 GB → 284 MB, soit environ 1536 MB sur les 1623 MB gagnés au total (environ 95 %).
+- Les étapes 4 à 6 (dépendances, multi-stage, config) ne gagnent que 27 MB à elles trois. Elles restent utiles : moins de dépendances, pas de npm dans l'image finale, plus de root.
+- Certaines étapes n'agissent pas sur la taille. L'étape 1 n'a pas réduit l'image (1.88 → 1.89 GB) : son effet est sur le contexte de build (48 kB). L'étape 3 ne change pas la taille non plus : elle fait gagner du temps au rebuild (4.9 s → 1.4 s après modification de `server.js`).
+- Node représente environ 179 MB sur 257 MB. Descendre beaucoup plus demanderait une autre base d'image, que je n'ai pas testée.
