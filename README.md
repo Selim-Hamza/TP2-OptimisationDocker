@@ -321,3 +321,45 @@ Hello world — serveur volontairement non optimisé mais fonctionnel
 - L'intérêt est la structure : pour une app avec un vrai build (TypeScript, React...) on installerait toutes les dépendances dans `builder` et on ne copierait que le résultat compilé dans l'image finale
 - Bilan par rapport à la baseline, 1.88 GB → 257 MB (-86 %) et 474 MB → 63.7 MB en compressé
 - Node représente maintenant environ 93 % de l'image donc il reste très peu à gagner sur la taille
+
+
+## Étape 6 : Configuration d'exécution
+
+Pour cette étape je change seulement la configuration du stage final. Je m'attends à aucun gros changement de taille car ce sont des métadonnées et pas du contenu.
+Trois changements :
+- `USER root` → `USER node` : l'app tournait en root dans le conteneur. L'image `node` fournit déjà un utilisateur `node` sans privilèges.
+- `ENV NODE_ENV=development` → `production` : c'est la convention Node, certaines bibliothèques (comme Express) adaptent leur comportement.
+- `EXPOSE 3000 4000 5000` → `EXPOSE 3000` : `EXPOSE` ne publie aucun port il documente seulement. `server.js` n'écoute que sur 3000
+
+```bash
+$ docker run --rm tp2:05b-builder whoami
+root
+$ docker run --rm tp2:06-securite whoami
+node
+$ docker run --rm tp2:06-securite printenv NODE_ENV
+production
+$ docker run --rm tp2:06-securite touch /test
+touch: /test: Permission denied
+$ docker inspect tp2:06-securite --format '{{json .Config.ExposedPorts}}'
+{"3000/tcp":{}}
+$ docker images tp2
+IMAGE                  ID             DISK USAGE   CONTENT SIZE
+tp2:05b-builder        4480c0474d33        257MB         63.7MB
+tp2:06-securite        9d7e81c1b604        257MB         63.7MB
+```
+Test que l'app marche toujours avec l'utilisateur `node` :
+```bash
+$ docker run -d --rm -p 3000:3000 --name tp2 tp2:06-securite
+$ sleep 2
+$ curl localhost:3000
+Hello world — serveur volontairement non optimisé mais fonctionnel
+$ docker logs tp2
+Serveur démarré sur le port 3000
+[2026-11-16T17:46:44.661Z] GET /
+```
+
+**Coclusion :**
+- La taille ne change pas (257 MB avant et après) comme prévu.
+- Le `touch /test` refusé confirme que le conteneur n'a plus les droits root. Si l'app était compromise, l'attaquant aurait moins de droits.
+- L'app marche sans `chown` , elle ne fait que lire ses fichiers, qui restent lisibles par l'utilisateur `node`. Un `chown -R` dans un `RUN` aurait dupliqué une couche et fait grossir l'image.
+- Je n'ai pas mesuré l'effet de `NODE_ENV=production` : `server.js` ne l'utilise pas directement donc je ne peux pas dire qu'il change quelque chose ici. Je le mets par convention.
